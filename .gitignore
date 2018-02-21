@@ -1,0 +1,6 @@
+sacapus_results/
+master/input/
+master/output/
+master/tmp/
+master/.snakemake/
+*~

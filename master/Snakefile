@@ -1,0 +1,169 @@
+WDIR="/home/oussedik/Documents/projet/master/"
+workdir: WDIR
+
+#On indiquera hg38 pour passer sur l'human
+GENOME="mm10"
+
+#On indiquera homo_sapiens pour l'human
+SPECIES="mus_musculus"
+
+#version d'ENSEMBL sur laquelle on cherchera les annotations du génome.
+RELEASE="90"
+
+
+#Chemins vers les ressources intermédiaires
+#INTERSECTED_BED = "output/intersect_bed/intersected.bed"
+
+
+PEAK_FILE, = glob_wildcards("input/bed/{peak}.bed")
+
+
+rule final:
+	input:  expand("output/select_chr/annotation-{gn}_chr.gtf.bgz.tbi", gn=GENOME), \
+			expand("output/tabulate/annotation-{gn}_chr_ann_tss_intersect.tab", gn=GENOME,peak=PEAK_FILE), \
+			test_excel.txt
+
+rule get_gtf:
+	output: "output/get_gtf/annotation-{gn}.gtf"
+	params: sp=SPECIES, r=RELEASE
+	shell: """
+		source activate gtftk
+		gtftk retrieve -s {params.sp} -r {params.r} -o {output}.gz
+		gunzip {output}.gz
+		"""
+
+# WARNING
+# Dataset is restricted to chr1 and 2
+# delete | awk  'BEGIN{{FS="\t"}}$1!="1" | $1!="2"'
+# to apply to all chr
+rule select_chr:
+	input:  "output/get_gtf/annotation-{gn}.gtf"
+	output: "output/select_chr/annotation-{gn}_chr.gtf"
+	params: sp=SPECIES, r=RELEASE
+	shell: """
+
+		source activate gtftk
+		awk 'BEGIN{{FS="\t"}}$1!="MT"' {input}| awk  'BEGIN{{FS="\t"}}$1=="1" || $1=="2"' |\
+		perl -ne 'print unless(/^#/)' | sed 's/^/chr/' | sortBed > {output}
+		"""
+
+rule index_gtf:
+	input:	"output/select_chr/annotation-{gn}_chr.gtf"
+	output: "output/select_chr/annotation-{gn}_chr.gtf.bgz.tbi"
+	shell: """
+		source activate gtftk
+		cat {input} | sortBed | bgzip > {input}.bgz
+		tabix {input}.bgz -p gff
+	"""
+
+rule get_chrom_size:
+	output: "output/get_chrom_size/chrom_size_{gn}.txt"
+	params: gn=GENOME
+	shell : """
+	mysql --user=genome --host=genome-mysql.cse.ucsc.edu -A -e "select chrom, size from {params.gn}.chromInfo"  > {output}
+		"""
+
+rule is_overlapping:
+	input: 	gtf="output/select_chr/annotation-{gn}_chr.gtf", \
+		cs="output/get_chrom_size/chrom_size_{gn}.txt"
+	output: "output/is_overlapping/annotation-{gn}_chr_over.gtf"
+	shell: """
+	gtftk divergent -a prom_overlap_tss_from_other_gene -u 2500 -d 2500 -S -i {input.gtf}  -o {output} -c {input.cs} -K output/is_overlapping
+	"""
+
+rule alt_prom:
+	input:
+		gtf= "annotation-mm10_chr1.gtf"
+		txt= "output/get_chrom_size/chrom_size_mm10.txt"
+		bed= "H3K4me3_kidney_ENCFF499PIW.bed, H3K4me3_testis_ENCFF004YUW.bed"
+	output:
+		"test_alt_prom.txt"
+	shell: """
+		gtftk alt_prom -K tmp -V 2 -t 500 -i {input.gtf} -o {output} -m 2500 -c {input.txt} {input.bed}
+		"""
+
+rule annotation:
+	input: gtf="output/is_overlapping/annotation-{gn}_chr_over.gtf", cs="output/get_chrom_size/chrom_size_{gn}.txt"
+	output: "output/annotation/annotation-{gn}_chr_ann.gtf"
+	shell: """
+	gtftk divergent  -u 2500 -d 2500 -i {input.gtf} -c {input.cs} -K output/annotation -V 2 | \
+	gtftk convergent -u 2500 -d 2500 -c {input.cs} -K output/annotation -V 2 | \
+	gtftk nb_exons -V 2 | \
+	gtftk feature_size  -t transcript -k tx_genomic_size -V 2 | \
+	gtftk feature_size -V 2 -t mature_rna -k mature_rna_size | sortBed | \
+	gtftk select_by_intron_size -d  -a -s 0  -o {output}
+	"""
+
+
+
+
+rule get_tss:
+	input: "output/annotation/annotation-{gn}_chr_ann.gtf"
+	output: start="output/get_tss/tss-{gn}_start.txt", \
+			end="output/get_tss/tss-{gn}_end.txt",\
+			bed="output/get_tss/tss-{gn}_chr_ann_gn.bed"
+	shell: """
+	gtftk 5p_3p_coord -V 2 -C -i {input} -t transcript -n transcript_id -o {output.bed}
+	gtftk 5p_3p_coord -V 2 -C -i {input} -t transcript -n transcript_id | awk 'BEGIN{{FS=OFS="\t"}}{{print $4,$2}}' > {output.start}
+	gtftk 5p_3p_coord -V 2 -C -i {input} -t transcript -n transcript_id | awk 'BEGIN{{FS=OFS="\t"}}{{print $4,$3}}' > {output.end}
+	"""
+
+rule join_tss:
+	input: gtf="output/annotation/annotation-{gn}_chr_ann.gtf", txt="output/get_tss/tss-{gn}_start.txt"
+	output: gtf="output/join_tss/annotation-{gn}_chr_ann_tss.gtf"
+	shell: """
+	gtftk join_attr -V 2 -i {input.gtf} -k transcript_id -j {input.txt} -n tss_start -t transcript | \
+	gtftk join_attr -V 2 -k transcript_id -j output/get_tss/tss-{wildcards.gn}_end.txt -n tss_end -t transcript -o {output}
+	"""
+
+
+
+rule intersection:
+	input:
+		data="output/get_tss/tss-{gn}_chr_ann_gn.bed",
+		bed="input/bed/{peak}.bed"
+	output: "output/intersect_bed/{peak}_intersect_tss_{gn}.bed"
+
+	shell: """
+		bedtools intersect -wa -wb -filenames -a {input.data} -b {input.bed} |  perl -npe  's/(Peak_\d+)/$1|{wildcards.peak}/' > {output}
+		""
+
+
+rule prepare_to_join:
+	input: "output/intersect_bed/{peak}_intersect_tss_{gn}.bed"
+	output: "output/prepare_to_join/{peak}_intersect_tss_{gn}_to_join.txt"
+
+	shell: """
+		cut -f 4,7,8,9,10 {input}  | awk 'BEGIN{{FS=OFS="\t"; print "transcript\t{wildcards.peak}_intersect"}}{{print $1,$2"-"$3":"$4}}' > {output}
+		"""
+
+rule join_bed:
+	input:
+		gtf="output/join_tss/annotation-{gn}_chr_ann_tss.gtf", \
+		cut=expand("output/prepare_to_join/{peak}_intersect_tss_{gn}_to_join.txt", gn=GENOME,peak=PEAK_FILE)
+	output:
+		"output/join_bed/annotation-{gn}_chr_ann_tss_intersect.gtf"
+	shell:"""
+	gtftk join_attr_multi -i {input.gtf} -k transcript_id -t transcript {input.cut} -o {output}
+	"""
+
+
+rule tabulate_gtf:
+	input:
+		gtf="output/join_bed/annotation-{gn}_chr_ann_tss_intersect.gtf"
+	output:
+		tab="output/tabulate/annotation-{gn}_chr_ann_tss_intersect.tab"
+	params: peaks=",".join([x + "_intersect" for x in PEAK_FILE])
+	shell: """
+	gtftk select_by_key -t -i {input} | gtftk tabulate -V 2  -k chrom,start,end,transcript_id,score,strand,feature,gene_name,gene_id,tss_start,tss_end,divergent,convergent,gene_biotype,prom_overlap_tss_from_other_gene,nb_exons,tx_genomic_size,mature_rna_size,intron_size,{params.peaks} -o {output}
+	"""
+
+
+
+rule alt_prom_chr1:
+		input: "test_alt_prom.txt"
+		output:
+			"test_excel.txt"
+		shell: """
+		awk '$21==1 || NR == 1' {input}  > {output}
+		"""
