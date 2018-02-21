@@ -1,6 +1,7 @@
 WDIR="/home/oussedik/Documents/projet/master/"
 workdir: WDIR
 
+
 #On indiquera hg38 pour passer sur l'human
 GENOME="mm10"
 
